@@ -1,0 +1,3 @@
+csv_data/*
+.env
+.vscode/c_cpp_properties.json
