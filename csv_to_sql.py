@@ -1,15 +1,19 @@
 import csv
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from itertools import chain
 
 import mariadb
 from dotenv import load_dotenv
 
+# Starttijd van het programma (voor "totaal verstreken tijd")
+PROGRAM_START = time.perf_counter()
+
 CSV_FOLDER = "csv_data"
 PROGRESS_EVERY = 1000
-COMMIT_EVERY = 1000
+BATCH_SIZE = 1000  # aantal regels per executemany + commit
 
 load_dotenv()
 
@@ -25,6 +29,20 @@ if not DB_USER or DB_PASSWORD is None or not DB_NAME:
     print("  DB_PASSWORD")
     print("  DB_NAME")
     sys.exit(1)
+
+
+def format_duration(seconds):
+    """Zet seconden om naar UU:MM:SS."""
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def per_minute(count, seconds):
+    """Aantal regels per minuut (0 als er nog geen tijd verstreken is)."""
+    if seconds <= 0:
+        return 0.0
+    return count / seconds * 60
 
 
 def parse_start_datetime(value):
@@ -109,6 +127,7 @@ def process_csv_file(
     file_number,
     total_files,
 ):
+    """Verwerkt één CSV-bestand en geeft een dict met statistieken terug."""
     filename = os.path.basename(filepath)
 
     print()
@@ -116,15 +135,32 @@ def process_csv_file(
     print(f"[{file_number}/{total_files}] Verwerken: {filename}")
     print("=" * 70)
 
+    file_start = time.perf_counter()
+
+    stats = {
+        "file": filename,
+        "read": 0,
+        "inserted": 0,
+        "skipped": 0,
+        "seconds": 0.0,
+        "status": "OK",
+    }
+
     file_handle = None
     cursor = None
+
+    processed = 0
+    inserted = 0
+    committed = 0  # aantal regels dat echt definitief in de database staat
+    skipped = 0
 
     try:
         try:
             file_handle, reader, encoding = open_csv_file(filepath)
         except OSError as error:
             print(f"  Kan bestand niet openen: {error}")
-            return
+            stats["status"] = "Fout (openen)"
+            return stats
 
         print(f"  Encoding: {encoding}")
 
@@ -137,13 +173,15 @@ def process_csv_file(
 
         if first_row is None:
             print("  Geen data gevonden.")
-            return
+            stats["status"] = "Geen data"
+            return stats
 
         field_count = len(first_row)
 
         if field_count < 3:
             print("  Overgeslagen: minder dan 3 CSV-velden.")
-            return
+            stats["status"] = "Overgeslagen"
+            return stats
 
         print(f"  CSV-velden: {field_count}")
 
@@ -151,7 +189,8 @@ def process_csv_file(
             table_name = make_table_name(vehicle_name, first_row)
         except ValueError as error:
             print(f"  Fout: {error}")
-            return
+            stats["status"] = "Fout (tabelnaam)"
+            return stats
 
         print(f"  Tabel: {table_name}")
 
@@ -159,7 +198,8 @@ def process_csv_file(
             create_table(connection, table_name, field_count)
         except mariadb.Error as error:
             print(f"  Fout bij maken tabel: {error}")
-            return
+            stats["status"] = "Fout (tabel)"
+            return stats
 
         column_names = ["`timestamp`", "`C0`"]
         column_names.extend(f"`C{i + 1}`" for i in range(field_count))
@@ -175,12 +215,27 @@ def process_csv_file(
 
         cursor = connection.cursor()
 
-        processed = 0
-        inserted = 0
-        skipped = 0
+        # Tijdmeting voor deze file begint hier (na voorbereiding)
+        file_start = time.perf_counter()
+
+        batch = []
+
+        def flush_batch():
+            """Schrijft de huidige batch in één keer naar de database en commit."""
+            nonlocal inserted, committed
+
+            if not batch:
+                return
+
+            cursor.executemany(insert_sql, batch)
+            connection.commit()
+
+            inserted += len(batch)
+            committed = inserted
+            batch.clear()
 
         def process_row(row):
-            nonlocal inserted, skipped
+            nonlocal skipped
 
             if not row or is_comment(row):
                 return
@@ -216,8 +271,10 @@ def process_csv_file(
                     f"maar {placeholder_count} placeholders."
                 )
 
-            cursor.execute(insert_sql, values)
-            inserted += 1
+            batch.append(values)
+
+            if len(batch) >= BATCH_SIZE:
+                flush_batch()
 
         for row in chain([first_row], reader):
             processed += 1
@@ -226,41 +283,65 @@ def process_csv_file(
                 process_row(row)
 
             except mariadb.Error as error:
-                print(f"\n  Databasefout bij regel {processed}: {error}")
+                print(
+                    f"\n  Databasefout rond regel {processed} "
+                    f"(huidige batch van maximaal {BATCH_SIZE:,} regels "
+                    f"is teruggedraaid): {error}"
+                )
                 connection.rollback()
-                return
+                inserted = committed
+                stats["status"] = "Fout (database)"
+                return stats
 
             except RuntimeError as error:
                 print(f"\n  {error}")
                 connection.rollback()
-                return
+                inserted = committed
+                stats["status"] = "Fout (intern)"
+                return stats
 
             if processed % PROGRESS_EVERY == 0:
-                print(
-                    f"\r  Bezig... {processed:,} regels gelezen | "
-                    f"{inserted:,} toegevoegd",
-                    end="",
-                    flush=True,
+                file_elapsed = time.perf_counter() - file_start
+                total_elapsed = time.perf_counter() - PROGRAM_START
+
+                line = (
+                    f"  Bezig... {processed:,} regels gelezen | "
+                    f"{inserted:,} toegevoegd | "
+                    f"totaal {format_duration(total_elapsed)} | "
+                    f"{per_minute(processed, file_elapsed):,.0f} gelezen/min | "
+                    f"{per_minute(inserted, file_elapsed):,.0f} upload/min"
                 )
+                # ljust voorkomt restjes van een eerdere, langere regel
+                print("\r" + line.ljust(120), end="", flush=True)
 
-            if inserted > 0 and inserted % COMMIT_EVERY == 0:
-                connection.commit()
+        # Resterende regels (minder dan BATCH_SIZE) wegschrijven
+        flush_batch()
 
-        connection.commit()
+        file_elapsed = time.perf_counter() - file_start
 
         print()
-        print(f"  Klaar: {inserted:,} regels toegevoegd.")
+        print(
+            f"  Klaar: {inserted:,} regels toegevoegd "
+            f"in {format_duration(file_elapsed)} "
+            f"({per_minute(inserted, file_elapsed):,.0f} regels/min)."
+        )
 
         if skipped > 0:
             print(f"  Overgeslagen: {skipped:,} regels.")
 
+        return stats
+
     except UnicodeDecodeError as error:
         print()
         print(f"  Encodingfout in {filename}: {error}")
+        stats["status"] = "Fout (encoding)"
+        return stats
 
     except OSError as error:
         print()
         print(f"  Leesfout in {filename}: {error}")
+        stats["status"] = "Fout (lezen)"
+        return stats
 
     except mariadb.Error as error:
         print()
@@ -269,12 +350,21 @@ def process_csv_file(
             connection.rollback()
         except Exception:
             pass
+        inserted = committed
+        stats["status"] = "Fout (database)"
+        return stats
 
     finally:
         if cursor is not None:
             cursor.close()
         if file_handle is not None:
             file_handle.close()
+
+        # Statistieken vullen (ook bij fouten en vroege returns)
+        stats["read"] = processed
+        stats["inserted"] = inserted
+        stats["skipped"] = skipped
+        stats["seconds"] = time.perf_counter() - file_start
 
 
 def find_csv_files(folder):
@@ -298,6 +388,57 @@ def find_csv_files(folder):
 
     files.sort()
     return files
+
+
+def print_summary(results, upload_seconds):
+    total_read = sum(r["read"] for r in results)
+    total_inserted = sum(r["inserted"] for r in results)
+    total_skipped = sum(r["skipped"] for r in results)
+    program_seconds = time.perf_counter() - PROGRAM_START
+
+    name_width = min(max(len(r["file"]) for r in results), 40)
+    name_width = max(name_width, len("Bestand"))
+
+    header = (
+        f"{'Bestand'.ljust(name_width)} | {'Gelezen':>10} | {'Toegevoegd':>10} | "
+        f"{'Overgesl.':>9} | {'Duur':>8} | {'Regels/min':>10} | Status"
+    )
+
+    print()
+    print("=" * len(header))
+    print("OVERZICHT PER BESTAND")
+    print("=" * len(header))
+    print(header)
+    print("-" * len(header))
+
+    for r in results:
+        name = r["file"]
+        if len(name) > name_width:
+            name = name[: name_width - 3] + "..."
+
+        print(
+            f"{name.ljust(name_width)} | {r['read']:>10,} | {r['inserted']:>10,} | "
+            f"{r['skipped']:>9,} | {format_duration(r['seconds']):>8} | "
+            f"{per_minute(r['inserted'], r['seconds']):>10,.0f} | {r['status']}"
+        )
+
+    print("-" * len(header))
+    print()
+    print("TOTALEN")
+    print(f"  Bestanden verwerkt:       {len(results):,}")
+    print(f"  Regels gelezen:           {total_read:,}")
+    print(f"  Regels toegevoegd:        {total_inserted:,}")
+    print(f"  Regels overgeslagen:      {total_skipped:,}")
+    print(f"  Totale uploadduur:        {format_duration(upload_seconds)}")
+    print(f"  Totale programmaduur:     {format_duration(program_seconds)}")
+    print(
+        f"  Gemiddeld gelezen:        "
+        f"{per_minute(total_read, upload_seconds):,.0f} regels/min"
+    )
+    print(
+        f"  Gemiddelde uploadsnelheid: "
+        f"{per_minute(total_inserted, upload_seconds):,.0f} regels/min"
+    )
 
 
 def main():
@@ -338,11 +479,14 @@ def main():
     connection = connect_database()
     print("Databaseverbinding OK.")
 
+    results = []
+    upload_start = time.perf_counter()
+
     try:
         total_files = len(csv_files)
 
         for file_number, filepath in enumerate(csv_files, start=1):
-            process_csv_file(
+            result = process_csv_file(
                 connection,
                 filepath,
                 vehicle_name,
@@ -350,8 +494,13 @@ def main():
                 file_number,
                 total_files,
             )
+            results.append(result)
     finally:
         connection.close()
+
+    upload_seconds = time.perf_counter() - upload_start
+
+    print_summary(results, upload_seconds)
 
     print()
     print("==============================================")
